@@ -1,0 +1,37 @@
+[package]
+name = "deepseek-widget"
+version = "0.1.0"
+edition = "2021"
+description = "DeepSeek 桌面小部件（托盘 + 原生绘制小组件 + 平台用量自动捕获）"
+
+# ── 跨平台核心逻辑：可在任意平台编译与测试 ──
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ── 仅 Windows 才拉入 GUI/网络重依赖（Linux 上 cargo test 不会编译它们）──
+[target.'cfg(windows)'.dependencies]
+tao = "0.31"
+wry = "0.52"
+tray-icon = "0.20"
+eframe = { version = "0.31", default-features = false, features = ["glow"] }
+egui = "0.31"
+ureq = { version = "2", features = ["json"] }
+directories = "6"
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
+  "Win32_Security",
+] }
+
+[profile.release]
+opt-level = "z"     # 体积优先
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[[bin]]
+name = "DeepSeekWidget"
+path = "src/main.rs"
