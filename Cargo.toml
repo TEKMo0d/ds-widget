@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-widget"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "DeepSeek 桌面小部件（托盘 + 原生绘制小组件 + 平台用量自动捕获）"
 
