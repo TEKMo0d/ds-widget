@@ -138,14 +138,12 @@ pub fn save_cache(c: &Cache) {
 // ───────── 今天（本地时区，取整到日） ─────────
 
 pub fn today_local() -> Ymd {
-    // 本地时区偏移：用 std 计算较麻烦，这里用 UTC 天 + 环境时区近似。
-    // 对“最近 N 天”的边界足够；若跨零点误差一天，下次刷新即修正。
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    // 尝试读取本地偏移（Windows：通过 GetTimeZoneInformation 太重，简单用 UTC）
-    core::ymd_from_unix(secs)
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    Ymd {
+        y: t.wYear as i64,
+        m: t.wMonth as i64,
+        d: t.wDay as i64,
+    }
 }
 
 // ───────── 重放 ─────────
@@ -347,12 +345,8 @@ fn sv2(v: &Value, k: &str, def: &str) -> String {
 }
 
 pub fn now_hms() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let s = secs % 86_400;
-    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!("{:02}:{:02}:{:02}", t.wHour, t.wMinute, t.wSecond)
 }
 
 pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \

@@ -136,36 +136,12 @@ fn toggle_widget(child: &mut Option<Child>) {
     }
 }
 
+/// 托盘图标：编译期嵌入的 32x32 RGBA（DeepSeek 娘头像徽章，见 assets/）。
+pub const ICON_32: &[u8] = include_bytes!("../../assets/icon_32.rgba");
+pub const ICON_64: &[u8] = include_bytes!("../../assets/icon_64.rgba");
+
 fn make_icon() -> tray_icon::Icon {
-    // 32x32 RGBA：深色圆底 + 三根柱子
-    let (w, h) = (32u32, 32u32);
-    let mut rgba = vec![0u8; (w * h * 4) as usize];
-    let put = |buf: &mut [u8], x: u32, y: u32, c: [u8; 4]| {
-        if x < w && y < h {
-            let i = ((y * w + x) * 4) as usize;
-            buf[i..i + 4].copy_from_slice(&c);
-        }
-    };
-    // 底色
-    for y in 2..30 {
-        for x in 2..30 {
-            put(&mut rgba, x, y, [20, 20, 22, 255]);
-        }
-    }
-    // 三根柱
-    let bars = [
-        (7u32, 18u32, [167, 205, 245, 255]),
-        (14u32, 12u32, [91, 156, 240, 255]),
-        (21u32, 7u32, [31, 111, 224, 255]),
-    ];
-    for (bx, top, col) in bars {
-        for y in top..26 {
-            for x in bx..bx + 4 {
-                put(&mut rgba, x, y, col);
-            }
-        }
-    }
-    tray_icon::Icon::from_rgba(rgba, w, h).expect("icon")
+    tray_icon::Icon::from_rgba(ICON_32.to_vec(), 32, 32).expect("icon")
 }
 
 // ───────── 单实例（命名互斥体） ─────────
