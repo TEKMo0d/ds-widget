@@ -1,4 +1,4 @@
-//! Windows 平台层：命令分派 + 托盘 + API Key 对话框 + 开机自启。
+//! Windows 平台层：命令分派 + 托盘 + 设置窗口 + 开机自启。
 
 pub mod login;
 pub mod store;
@@ -17,9 +17,14 @@ pub fn run() {
     match arg.as_str() {
         "--widget" => widget::run(),
         "--login" => login::run(),
-        "--setkey" => setkey_dialog(),
+        "--settings" | "--setkey" => widget::run_settings(),
         _ => tray_main(),
     }
+}
+
+/// 打开设置窗口（独立进程，可从托盘或小组件调用）。
+pub fn open_settings() {
+    let _ = spawn("--settings");
 }
 
 fn exe() -> std::path::PathBuf {
@@ -48,7 +53,7 @@ fn tray_main() {
         "登录 DeepSeek 平台（同步用量）…"
     };
     let mi_login = MenuItem::new(login_label, true, None);
-    let mi_key = MenuItem::new("设置 API Key…", true, None);
+    let mi_key = MenuItem::new("设置…", true, None);
     let mi_autostart = CheckMenuItem::new("开机自启", true, autostart_enabled(), None);
     let mi_folder = MenuItem::new("打开数据目录", true, None);
     let mi_quit = MenuItem::new("退出", true, None);
@@ -78,6 +83,7 @@ fn tray_main() {
 
     let mut widget_child: Option<Child> = None;
     let mut login_child: Option<Child> = None;
+    let mut widget_shown = false; // 菜单文字当前对应的状态
 
     let id_widget = mi_widget.id().clone();
     let id_login = mi_login.id().clone();
@@ -87,7 +93,19 @@ fn tray_main() {
     let id_quit = mi_quit.id().clone();
 
     event_loop.run(move |_event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        // 定时醒来轮询：小组件可能被用户从窗口上直接关闭
+        *control_flow = ControlFlow::WaitUntil(
+            std::time::Instant::now() + std::time::Duration::from_millis(500),
+        );
+
+        // 菜单文字跟随小组件进程存活状态
+        let alive = widget_child
+            .as_mut()
+            .map_or(false, |c| c.try_wait().ok().flatten().is_none());
+        if alive != widget_shown {
+            widget_shown = alive;
+            mi_widget.set_text(if alive { "关闭小组件" } else { "显示小组件" });
+        }
 
         // 双击托盘图标 = 显示/关闭小组件
         if let Ok(ev) = tray_channel.try_recv() {
@@ -105,7 +123,7 @@ fn tray_main() {
                     login_child = spawn("--login");
                 }
             } else if id == id_key {
-                spawn("--setkey");
+                spawn("--settings");
             } else if id == id_autostart {
                 toggle_autostart();
             } else if id == id_folder {
@@ -225,90 +243,4 @@ fn winreg_delete() {
             "/f",
         ])
         .status();
-}
-
-// ───────── API Key 对话框（egui 小窗） ─────────
-
-fn setkey_dialog() {
-    use eframe::egui;
-
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([380.0, 180.0])
-            .with_resizable(false)
-            .with_always_on_top(),
-        ..Default::default()
-    };
-
-    struct KeyApp {
-        input: String,
-        show: bool,
-        msg: (String, egui::Color32),
-        cur_masked: String,
-    }
-
-    let cfg = store::load_config();
-    let cur = cfg.api_key.clone();
-    let masked = if cur.len() > 12 {
-        format!("{}…{}", &cur[..6], &cur[cur.len() - 4..])
-    } else if cur.is_empty() {
-        "（未设置）".into()
-    } else {
-        cur.clone()
-    };
-
-    let _ = eframe::run_native(
-        "DeepSeek 设置",
-        options,
-        Box::new(move |_cc| {
-            Ok(Box::new(KeyApp {
-                input: String::new(),
-                show: false,
-                msg: ("粘贴 sk- 开头的密钥后点击保存".into(), egui::Color32::GRAY),
-                cur_masked: masked.clone(),
-            }) as Box<dyn eframe::App>)
-        }),
-    );
-
-    impl eframe::App for KeyApp {
-        fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("API Key（用于查询余额，可留空）").strong());
-                ui.label(egui::RichText::new(format!("当前：{}", self.cur_masked)).weak());
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let edit = egui::TextEdit::singleline(&mut self.input)
-                        .password(!self.show)
-                        .desired_width(280.0);
-                    ui.add(edit);
-                    if ui.button(if self.show { "隐藏" } else { "显示" }).clicked() {
-                        self.show = !self.show;
-                    }
-                });
-                ui.add_space(6.0);
-                ui.colored_label(self.msg.1, &self.msg.0);
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button("保存").clicked() {
-                        let key = self.input.trim().to_string();
-                        if key.is_empty() {
-                            self.msg = ("输入为空，未修改".into(), egui::Color32::from_rgb(240, 169, 93));
-                        } else if !key.starts_with("sk-") {
-                            self.msg = ("看起来不是有效的 Key（应以 sk- 开头）".into(), egui::Color32::from_rgb(240, 106, 93));
-                        } else {
-                            let mut c = store::load_config();
-                            c.api_key = key;
-                            store::save_config(&c);
-                            self.msg = ("✓ 已保存，小组件下次刷新即生效".into(), egui::Color32::from_rgb(52, 199, 123));
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    }
-                    if ui.button("取消").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-            });
-        }
-    }
 }

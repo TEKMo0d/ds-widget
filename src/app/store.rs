@@ -51,6 +51,12 @@ pub struct Config {
     pub window_width: f32,
     #[serde(default = "def_h")]
     pub window_height: f32,
+    /// 背景不透明度 0.2~1.0
+    #[serde(default = "def_opacity")]
+    pub opacity: f32,
+    /// 鼠标穿透（不遮挡点击）
+    #[serde(default)]
+    pub click_through: bool,
 }
 fn def_refresh() -> u64 {
     60
@@ -64,6 +70,9 @@ fn def_w() -> f32 {
 fn def_h() -> f32 {
     420.0
 }
+fn def_opacity() -> f32 {
+    1.0
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -73,6 +82,8 @@ impl Default for Config {
             days: 30,
             window_width: 340.0,
             window_height: 420.0,
+            opacity: 1.0,
+            click_through: false,
         }
     }
 }

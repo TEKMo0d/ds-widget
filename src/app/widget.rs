@@ -15,9 +15,7 @@ struct Snapshot {
     series: Vec<(String, Day)>,
     balance: Option<Balance>,
     balance_err: Option<String>,
-    source: String,
     note: String,
-    updated: String,
 }
 
 pub fn run() {
@@ -59,6 +57,9 @@ enum Tab {
 
 struct App {
     cfg: Config,
+    shared_cfg: Arc<Mutex<Config>>,
+    last_cfg_reload: std::time::Instant,
+    applied_passthrough: Option<bool>,
     tab: Tab,
     snap: Arc<Mutex<Snapshot>>,
     trigger: mpsc::Sender<()>,
@@ -68,6 +69,7 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>, cfg: Config) -> Self {
         setup_style(&cc.egui_ctx);
 
+        let shared_cfg = Arc::new(Mutex::new(cfg.clone()));
         let snap = Arc::new(Mutex::new(Snapshot {
             balance_err: Some("加载中…".into()),
             ..Default::default()
@@ -78,15 +80,15 @@ impl App {
             let snap = snap.clone();
             let ctx = cc.egui_ctx.clone();
             let days = cfg.days;
-            let cfg2 = cfg.clone();
+            let shared = shared_cfg.clone();
             let interval = cfg.refresh_seconds.max(10);
             thread::spawn(move || loop {
+                let cfg_now = shared.lock().unwrap().clone();
                 let res = store::get_usage(days);
-                let bal = store::fetch_balance(&cfg2);
+                let bal = store::fetch_balance(&cfg_now);
                 {
                     let mut s = snap.lock().unwrap();
                     s.series = res.series;
-                    s.source = res.source.to_string();
                     s.note = res.note;
                     match bal {
                         Ok(b) => {
@@ -102,7 +104,6 @@ impl App {
                             }
                         }
                     }
-                    s.updated = store::now_hms();
                 }
                 ctx.request_repaint();
                 // 等间隔或被手动唤醒
@@ -111,6 +112,9 @@ impl App {
         }
         App {
             cfg,
+            shared_cfg,
+            last_cfg_reload: std::time::Instant::now(),
+            applied_passthrough: None,
             tab: Tab::Balance,
             snap,
             trigger: tx,
@@ -124,12 +128,32 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 每秒重读配置：设置窗口保存后即时生效（透明度/穿透/API Key）
+        if self.last_cfg_reload.elapsed() > Duration::from_secs(1) {
+            self.last_cfg_reload = std::time::Instant::now();
+            let c = store::load_config();
+            if c.api_key != self.cfg.api_key {
+                *self.shared_cfg.lock().unwrap() = c.clone();
+                let _ = self.trigger.send(()); // 密钥变了立即刷新
+            }
+            self.cfg = c;
+        }
+        // 鼠标穿透开关（只在变化时下发）
+        if self.applied_passthrough != Some(self.cfg.click_through) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(
+                self.cfg.click_through,
+            ));
+            self.applied_passthrough = Some(self.cfg.click_through);
+        }
+        ctx.request_repaint_after(Duration::from_secs(1));
+
         let snap = self.snap.lock().unwrap().clone();
+        let op = self.cfg.opacity.clamp(0.2, 1.0);
 
         let frame = egui::Frame::new()
-            .fill(C_BG)
+            .fill(fade(C_BG, op))
             .corner_radius(14)
-            .stroke(egui::Stroke::new(1.0, C_LINE))
+            .stroke(egui::Stroke::new(1.0, fade(C_LINE, op)))
             .inner_margin(egui::Margin {
                 left: 14,
                 right: 14,
@@ -150,7 +174,7 @@ impl eframe::App for App {
 
             ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
                 ui.set_clip_rect(content_rect.expand(2.0));
-                self.titlebar(ui, &snap, ctx);
+                self.titlebar(ui, ctx);
                 if !snap.note.is_empty() {
                     ui.add_space(4.0);
                     note_bar(ui, &snap.note);
@@ -173,14 +197,19 @@ impl eframe::App for App {
 // ───────── 顶栏 ─────────
 
 impl App {
-    fn titlebar(&mut self, ui: &mut egui::Ui, snap: &Snapshot, ctx: &egui::Context) {
+    fn titlebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let bar_h = 28.0;
         let bar_rect =
             egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), bar_h));
 
-        // 先注册拖动区（在按钮之下），整条顶栏可按住拖动窗口
+        // 拖动区避开右侧按钮（egui 允许点击与拖拽命中不同控件，
+        // 若覆盖按钮，点按钮会同时触发窗口拖动的模态循环，导致 UI 卡顿）
+        let drag_rect = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2((ui.available_width() - 118.0).max(0.0), bar_h),
+        );
         let drag = ui.interact(
-            bar_rect,
+            drag_rect,
             ui.id().with("drag"),
             egui::Sense::click_and_drag(),
         );
@@ -205,19 +234,22 @@ impl App {
                         .color(C_TEXT),
                 );
                 ui.add_space(2.0);
-                let src = if snap.source == "web" { " · 平台" } else { "" };
+                // 实时时钟（update 里已有每秒重绘）
                 ui.label(
-                    egui::RichText::new(format!("{}{}", snap.updated, src))
+                    egui::RichText::new(store::now_hms())
                         .size(10.5)
                         .color(C_DIM),
                 );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icon_btn(ui, "✕").clicked() {
+                    if icon_btn(ui, "×").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     if icon_btn(ui, "—").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+                    if icon_btn(ui, "⚙").clicked() {
+                        crate::app::open_settings();
                     }
                     if icon_btn(ui, "⟳").clicked() {
                         let _ = self.trigger.send(());
@@ -229,10 +261,11 @@ impl App {
     }
 
     fn tabs(&mut self, ui: &mut egui::Ui) {
+        let op = self.cfg.opacity.clamp(0.2, 1.0);
         ui.add_space(6.0);
         egui::Frame::new()
-            .fill(C_CARD)
-            .stroke(egui::Stroke::new(1.0, C_LINE))
+            .fill(fade(C_CARD, op))
+            .stroke(egui::Stroke::new(1.0, fade(C_LINE, op)))
             .corner_radius(9)
             .inner_margin(egui::Margin::same(3))
             .show(ui, |ui| {
@@ -257,6 +290,7 @@ impl App {
 
 impl App {
     fn page_balance(&self, ui: &mut egui::Ui, snap: &Snapshot) {
+        let op = self.cfg.opacity.clamp(0.2, 1.0);
         ui.add_space(10.0);
         if let Some(err) = &snap.balance_err {
             ui.vertical_centered(|ui| {
@@ -274,7 +308,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.add_space(2.0);
             ui.label(
-                egui::RichText::new(&b.total)
+                egui::RichText::new(money(&b.total))
                     .size(36.0)
                     .strong()
                     .color(C_TEXT),
@@ -292,24 +326,24 @@ impl App {
             } else {
                 (C_RED, "余额不足")
             };
-            pill(ui, col, txt);
+            pill(ui, op, col, txt);
             if b.from_web {
-                pill(ui, C_DIM, "来自平台网页");
+                pill(ui, op, C_DIM, "来自平台网页");
             }
         });
 
         ui.add_space(14.0);
         // 明细卡片
         egui::Frame::new()
-            .fill(C_CARD)
-            .stroke(egui::Stroke::new(1.0, C_LINE))
+            .fill(fade(C_CARD, op))
+            .stroke(egui::Stroke::new(1.0, fade(C_LINE, op)))
             .corner_radius(10)
             .inner_margin(egui::Margin::symmetric(12, 4))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                row(ui, "充值余额", &format!("{} {}", b.topped_up, b.currency));
+                row(ui, "充值余额", &format!("{} {}", money(&b.topped_up), b.currency));
                 sep(ui);
-                row(ui, "赠送余额", &format!("{} {}", b.granted, b.currency));
+                row(ui, "赠送余额", &format!("{} {}", money(&b.granted), b.currency));
             });
 
         // 今日两块统计
@@ -319,8 +353,8 @@ impl App {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let w = (ui.available_width() - 8.0) / 2.0;
-            stat(ui, w, "今日请求", &fmt(today.requests));
-            stat(ui, w, "今日 Tokens", &fmt(tok));
+            stat(ui, op, w, "今日请求", &fmt(today.requests));
+            stat(ui, op, w, "今日 Tokens", &fmt(tok));
         });
     }
 }
@@ -559,7 +593,7 @@ fn tooltip(ui: &egui::Ui, pos: egui::Pos2, date: &str, d: &Day, tok: bool) {
 
 // ───────── 小组件通用绘制辅助 ─────────
 
-fn setup_style(ctx: &egui::Context) {
+pub(crate) fn setup_style(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
     fonts.font_data.insert(
@@ -601,7 +635,7 @@ fn icon_btn(ui: &mut egui::Ui, txt: &str) -> egui::Response {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         txt,
-        egui::FontId::proportional(13.0),
+        egui::FontId::proportional(if txt == "×" { 16.0 } else { 13.0 }),
         col,
     );
     resp
@@ -634,10 +668,10 @@ fn tab_btn(ui: &mut egui::Ui, w: f32, txt: &str, active: bool, mut on: impl FnMu
     }
 }
 
-fn pill(ui: &mut egui::Ui, dot: egui::Color32, txt: &str) {
+fn pill(ui: &mut egui::Ui, op: f32, dot: egui::Color32, txt: &str) {
     egui::Frame::new()
-        .fill(C_CARD)
-        .stroke(egui::Stroke::new(1.0, C_LINE))
+        .fill(fade(C_CARD, op))
+        .stroke(egui::Stroke::new(1.0, fade(C_LINE, op)))
         .corner_radius(99)
         .inner_margin(egui::Margin::symmetric(9, 3))
         .show(ui, |ui| {
@@ -673,10 +707,10 @@ fn sep(ui: &mut egui::Ui) {
     );
 }
 
-fn stat(ui: &mut egui::Ui, w: f32, k: &str, v: &str) {
+fn stat(ui: &mut egui::Ui, op: f32, w: f32, k: &str, v: &str) {
     egui::Frame::new()
-        .fill(C_CARD)
-        .stroke(egui::Stroke::new(1.0, C_LINE))
+        .fill(fade(C_CARD, op))
+        .stroke(egui::Stroke::new(1.0, fade(C_LINE, op)))
         .corner_radius(10)
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
@@ -785,6 +819,18 @@ fn note_bar(ui: &mut egui::Ui, note: &str) {
         });
 }
 
+/// 金额显示：能解析成数字就固定两位小数，否则原样（如 "-"）
+fn money(s: &str) -> String {
+    s.parse::<f64>()
+        .map(|v| format!("{:.2}", v))
+        .unwrap_or_else(|_| s.to_string())
+}
+
+/// 按不透明度衰减颜色（用于背景类颜色，文字保持不透明以保证可读）
+fn fade(c: egui::Color32, op: f32) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * op) as u8)
+}
+
 fn fmt(n: i64) -> String {
     // 千分位
     let s = n.abs().to_string();
@@ -800,6 +846,313 @@ fn fmt(n: i64) -> String {
         r.insert(0, '-');
     }
     r
+}
+
+// ───────── 设置窗口（与小组件同风格：无边框深色圆角） ─────────
+
+pub fn run_settings() {
+    let icon = egui::IconData {
+        rgba: crate::app::ICON_64.to_vec(),
+        width: 64,
+        height: 64,
+    };
+    let viewport = egui::ViewportBuilder::default()
+        .with_icon(icon)
+        .with_inner_size([340.0, 440.0])
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top()
+        .with_resizable(false);
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+
+    let cfg = store::load_config();
+    let masked = mask_key(&cfg.api_key);
+    let (op0, ct0) = (cfg.opacity.clamp(0.2, 1.0), cfg.click_through);
+
+    let _ = eframe::run_native(
+        "DeepSeek 小组件设置",
+        options,
+        Box::new(move |cc| {
+            setup_style(&cc.egui_ctx);
+            form_style(&cc.egui_ctx);
+            Ok(Box::new(SettingsApp {
+                key_input: String::new(),
+                show_key: false,
+                cur_masked: masked,
+                opacity: op0,
+                click_through: ct0,
+                msg: String::new(),
+            }) as Box<dyn eframe::App>)
+        }),
+    );
+}
+
+fn mask_key(cur: &str) -> String {
+    if cur.len() > 12 {
+        format!("{}…{}", &cur[..6], &cur[cur.len() - 4..])
+    } else if cur.is_empty() {
+        "（未设置）".into()
+    } else {
+        cur.to_string()
+    }
+}
+
+/// 表单控件（输入框/滑条/勾选框）的深色风格
+fn form_style(ctx: &egui::Context) {
+    ctx.style_mut(|s| {
+        let v = &mut s.visuals;
+        v.extreme_bg_color = egui::Color32::from_rgb(15, 15, 17); // TextEdit/滑条槽底色
+        v.selection.bg_fill = C_ACCENT;
+        v.selection.stroke = egui::Stroke::new(1.0, C_ACCENT_TEXT);
+        for w in [
+            &mut v.widgets.inactive,
+            &mut v.widgets.hovered,
+            &mut v.widgets.active,
+            &mut v.widgets.open,
+        ] {
+            w.bg_fill = C_CARD;
+            w.weak_bg_fill = C_CARD;
+            w.bg_stroke = egui::Stroke::new(1.0, C_LINE);
+            w.corner_radius = egui::CornerRadius::same(7);
+            w.fg_stroke = egui::Stroke::new(1.0, C_TEXT);
+        }
+        v.widgets.hovered.bg_fill = egui::Color32::from_rgb(40, 40, 44);
+        v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(40, 40, 44);
+        v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, C_ACCENT);
+        v.widgets.active.bg_stroke = egui::Stroke::new(1.0, C_ACCENT);
+        s.spacing.slider_width = 130.0;
+        s.spacing.button_padding = egui::vec2(10.0, 5.0);
+    });
+}
+
+struct SettingsApp {
+    key_input: String,
+    show_key: bool,
+    cur_masked: String,
+    opacity: f32,
+    click_through: bool,
+    msg: String,
+}
+
+impl eframe::App for SettingsApp {
+    fn clear_color(&self, _v: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
+        // 背景手动按窗口实际大小绘制：Frame 会随内容高度扩展，
+        // 内容略超出窗口时圆角下半截会被画到窗口外，导致底部变直角。
+        let frame = egui::Frame::new().inner_margin(egui::Margin {
+            left: 16,
+            right: 16,
+            top: 10,
+            bottom: 14,
+        });
+
+        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+            ui.painter().rect(
+                ctx.screen_rect().shrink(0.5),
+                14,
+                C_BG,
+                egui::Stroke::new(1.0, C_LINE),
+                egui::StrokeKind::Inside,
+            );
+            // 顶栏（可拖动）
+            let bar_h = 28.0;
+            let bar_rect = egui::Rect::from_min_size(
+                ui.cursor().min,
+                egui::vec2(ui.available_width(), bar_h),
+            );
+            // 拖动区避开右侧 × 按钮（原因见小组件 titlebar 注释）
+            let drag_rect = egui::Rect::from_min_size(
+                ui.cursor().min,
+                egui::vec2((ui.available_width() - 34.0).max(0.0), bar_h),
+            );
+            let drag = ui.interact(
+                drag_rect,
+                ui.id().with("drag"),
+                egui::Sense::click_and_drag(),
+            );
+            if drag.drag_started_by(egui::PointerButton::Primary) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            ui.scope_builder(egui::UiBuilder::new().max_rect(bar_rect), |ui| {
+                ui.horizontal_centered(|ui| {
+                    let c = ui.cursor().min;
+                    ui.painter().circle_filled(
+                        egui::pos2(c.x + 5.0, bar_rect.center().y),
+                        4.5,
+                        C_ACCENT,
+                    );
+                    ui.add_space(16.0);
+                    ui.label(
+                        egui::RichText::new("小组件设置")
+                            .strong()
+                            .size(14.0)
+                            .color(C_TEXT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_btn(ui, "×").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                });
+            });
+            ui.advance_cursor_after_rect(bar_rect);
+
+            ui.add_space(12.0);
+            section(ui, "API KEY");
+            card(ui, |ui| {
+                row(ui, "当前", &self.cur_masked);
+                sep(ui);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let w = ui.available_width() - 52.0;
+                    ui.add_sized(
+                        [w, 26.0],
+                        egui::TextEdit::singleline(&mut self.key_input)
+                            .password(!self.show_key)
+                            .hint_text("sk-…（留空则不修改）")
+                            .font(egui::FontId::monospace(12.0)),
+                    );
+                    let t = if self.show_key { "隐藏" } else { "显示" };
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new(t).size(11.5).color(C_DIM))
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::new(1.0, C_LINE))
+                                .corner_radius(7)
+                                .min_size(egui::vec2(44.0, 26.0)),
+                        )
+                        .clicked()
+                    {
+                        self.show_key = !self.show_key;
+                    }
+                });
+                ui.add_space(4.0);
+            });
+
+            ui.add_space(14.0);
+            section(ui, "外观");
+            card(ui, |ui| {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.set_height(28.0);
+                    ui.label(egui::RichText::new("背景不透明度").size(12.5).color(C_DIM));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.opacity, 0.2..=1.0)
+                                .trailing_fill(true)
+                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                .custom_parser(|s| {
+                                    s.trim_end_matches('%')
+                                        .parse::<f64>()
+                                        .ok()
+                                        .map(|v| v / 100.0)
+                                }),
+                        );
+                    });
+                });
+                ui.add_space(6.0);
+                sep(ui);
+                ui.add_space(8.0);
+                ui.checkbox(
+                    &mut self.click_through,
+                    egui::RichText::new("鼠标穿透（不遮挡点击）")
+                        .size(12.5)
+                        .color(C_TEXT),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(
+                        "开启后小组件完全不响应鼠标（无法拖动/点击），\n如需恢复请从托盘菜单进入「设置…」关闭本选项。",
+                    )
+                    .size(10.5)
+                    .color(C_DIM),
+                );
+                ui.add_space(2.0);
+            });
+
+            // 底部按钮（锚定底部）
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let save = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new("保存")
+                                .size(13.0)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(C_ACCENT)
+                        .corner_radius(8)
+                        .min_size(egui::vec2(92.0, 30.0)),
+                    );
+                    let cancel = ui.add(
+                        egui::Button::new(egui::RichText::new("取消").size(13.0).color(C_TEXT))
+                            .fill(C_CARD)
+                            .stroke(egui::Stroke::new(1.0, C_LINE))
+                            .corner_radius(8)
+                            .min_size(egui::vec2(68.0, 30.0)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new("保存后 1 秒内生效")
+                                .size(10.5)
+                                .color(C_DIM),
+                        );
+                    });
+                    if save.clicked() {
+                        let key = self.key_input.trim().to_string();
+                        if !key.is_empty() && !key.starts_with("sk-") {
+                            self.msg = "Key 看起来无效（应以 sk- 开头），未保存".into();
+                        } else {
+                            let mut c = store::load_config();
+                            if !key.is_empty() {
+                                c.api_key = key;
+                            }
+                            c.opacity = self.opacity;
+                            c.click_through = self.click_through;
+                            store::save_config(&c);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                    if cancel.clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                if !self.msg.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(&self.msg).size(11.0).color(C_RED));
+                }
+            });
+        });
+    }
+}
+
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.label(
+        egui::RichText::new(title)
+            .size(11.0)
+            .strong()
+            .color(C_DIM),
+    );
+    ui.add_space(6.0);
+}
+
+fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(C_CARD)
+        .stroke(egui::Stroke::new(1.0, C_LINE))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui);
+        });
 }
 
 // 配色
