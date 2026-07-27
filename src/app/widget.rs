@@ -60,6 +60,7 @@ struct App {
     shared_cfg: Arc<Mutex<Config>>,
     last_cfg_reload: std::time::Instant,
     applied_passthrough: Option<bool>,
+    applied_light: Option<bool>,
     tab: Tab,
     snap: Arc<Mutex<Snapshot>>,
     trigger: mpsc::Sender<()>,
@@ -68,6 +69,7 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, cfg: Config) -> Self {
         setup_style(&cc.egui_ctx);
+        apply_theme(&cc.egui_ctx, cfg.theme == "light");
 
         let shared_cfg = Arc::new(Mutex::new(cfg.clone()));
         let snap = Arc::new(Mutex::new(Snapshot {
@@ -115,6 +117,7 @@ impl App {
             shared_cfg,
             last_cfg_reload: std::time::Instant::now(),
             applied_passthrough: None,
+            applied_light: None,
             tab: Tab::Balance,
             snap,
             trigger: tx,
@@ -138,6 +141,12 @@ impl eframe::App for App {
             }
             self.cfg = c;
         }
+        // 主题（设置窗口保存或顶栏按钮切换后生效）
+        let light = self.cfg.theme == "light";
+        if self.applied_light != Some(light) {
+            apply_theme(ctx, light);
+            self.applied_light = Some(light);
+        }
         // 鼠标穿透开关（只在变化时下发）
         if self.applied_passthrough != Some(self.cfg.click_through) {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(
@@ -151,9 +160,9 @@ impl eframe::App for App {
         let op = self.cfg.opacity.clamp(0.2, 1.0);
 
         let frame = egui::Frame::new()
-            .fill(fade(C_BG, op))
+            .fill(fade(pal().bg, op))
             .corner_radius(14)
-            .stroke(egui::Stroke::new(1.0, fade(C_LINE, op)))
+            .stroke(egui::Stroke::new(1.0, fade(pal().line, op)))
             .inner_margin(egui::Margin {
                 left: 14,
                 right: 14,
@@ -206,7 +215,7 @@ impl App {
         // 若覆盖按钮，点按钮会同时触发窗口拖动的模态循环，导致 UI 卡顿）
         let drag_rect = egui::Rect::from_min_size(
             ui.cursor().min,
-            egui::vec2((ui.available_width() - 118.0).max(0.0), bar_h),
+            egui::vec2((ui.available_width() - 150.0).max(0.0), bar_h),
         );
         let drag = ui.interact(
             drag_rect,
@@ -231,14 +240,14 @@ impl App {
                     egui::RichText::new("DeepSeek")
                         .strong()
                         .size(14.0)
-                        .color(C_TEXT),
+                        .color(pal().text),
                 );
                 ui.add_space(2.0);
                 // 实时时钟（update 里已有每秒重绘）
                 ui.label(
                     egui::RichText::new(store::now_hms())
                         .size(10.5)
-                        .color(C_DIM),
+                        .color(pal().dim),
                 );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -250,6 +259,14 @@ impl App {
                     }
                     if icon_btn(ui, "⚙").clicked() {
                         crate::app::open_settings();
+                    }
+                    let sun = if is_light() { "🌙" } else { "☀" };
+                    if icon_btn(ui, sun).clicked() {
+                        // 立即生效并落盘；下一帧由 applied_light 检测统一应用
+                        let mut c = store::load_config();
+                        c.theme = if is_light() { "dark".into() } else { "light".into() };
+                        store::save_config(&c);
+                        self.cfg.theme = c.theme;
                     }
                     if icon_btn(ui, "⟳").clicked() {
                         let _ = self.trigger.send(());
@@ -264,8 +281,8 @@ impl App {
         let op = self.cfg.opacity.clamp(0.2, 1.0);
         ui.add_space(6.0);
         egui::Frame::new()
-            .fill(fade(C_CARD, op))
-            .stroke(egui::Stroke::new(1.0, fade(C_LINE, op)))
+            .fill(fade(pal().card, op))
+            .stroke(egui::Stroke::new(1.0, fade(pal().line, op)))
             .corner_radius(9)
             .inner_margin(egui::Margin::same(3))
             .show(ui, |ui| {
@@ -295,7 +312,7 @@ impl App {
         if let Some(err) = &snap.balance_err {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.label(egui::RichText::new("⚠ 余额获取失败").size(13.0).color(C_DIM));
+                ui.label(egui::RichText::new("⚠ 余额获取失败").size(13.0).color(pal().dim));
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new(err).color(C_RED).size(11.0));
             });
@@ -311,11 +328,11 @@ impl App {
                 egui::RichText::new(money(&b.total))
                     .size(36.0)
                     .strong()
-                    .color(C_TEXT),
+                    .color(pal().text),
             );
             ui.vertical(|ui| {
                 ui.add_space(14.0);
-                ui.label(egui::RichText::new(&b.currency).size(13.0).color(C_DIM));
+                ui.label(egui::RichText::new(&b.currency).size(13.0).color(pal().dim));
             });
         });
         ui.add_space(6.0);
@@ -328,15 +345,15 @@ impl App {
             };
             pill(ui, op, col, txt);
             if b.from_web {
-                pill(ui, op, C_DIM, "来自平台网页");
+                pill(ui, op, pal().dim, "来自平台网页");
             }
         });
 
         ui.add_space(14.0);
         // 明细卡片
         egui::Frame::new()
-            .fill(fade(C_CARD, op))
-            .stroke(egui::Stroke::new(1.0, fade(C_LINE, op)))
+            .fill(fade(pal().card, op))
+            .stroke(egui::Stroke::new(1.0, fade(pal().line, op)))
             .corner_radius(10)
             .inner_margin(egui::Margin::symmetric(12, 4))
             .show(ui, |ui| {
@@ -432,19 +449,19 @@ fn bar_chart(
         let y = rect.top() + frac * (rect.height() - 14.0) + 12.0;
         painter.line_segment(
             [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-            egui::Stroke::new(1.0, C_GRID),
+            egui::Stroke::new(1.0, pal().grid),
         );
         painter.text(
             egui::pos2(rect.left(), y - 12.0),
             egui::Align2::LEFT_TOP,
             fmt(val),
             egui::FontId::monospace(9.5),
-            C_DIM,
+            pal().dim,
         );
     }
     painter.line_segment(
         [rect.left_bottom(), rect.right_bottom()],
-        egui::Stroke::new(1.0, C_LINE),
+        egui::Stroke::new(1.0, pal().line),
     );
 
     // 柱区顶部让出网格标签的空间
@@ -465,7 +482,7 @@ fn bar_chart(
         let hovered = pointer.map_or(false, |p| col_rect.contains(p));
         if hovered {
             hover_idx = Some(i);
-            painter.rect_filled(col_rect, 3, egui::Color32::from_white_alpha(10));
+            painter.rect_filled(col_rect, 3, hover_tint(10));
         }
         // 堆叠，最顶段圆角收头
         let parts: Vec<(i64, egui::Color32)> =
@@ -527,11 +544,11 @@ fn tooltip(ui: &egui::Ui, pos: egui::Pos2, date: &str, d: &Day, tok: bool) {
         for (i, (k, v, col)) in lines.iter().enumerate() {
             let size = if i == 0 { 13.0 } else { 12.0 };
             let kw = f
-                .layout_no_wrap(k.clone(), egui::FontId::proportional(size), C_TEXT)
+                .layout_no_wrap(k.clone(), egui::FontId::proportional(size), pal().text)
                 .rect
                 .width();
             let vw = f
-                .layout_no_wrap(v.clone(), egui::FontId::monospace(size), C_TEXT)
+                .layout_no_wrap(v.clone(), egui::FontId::monospace(size), pal().text)
                 .rect
                 .width();
             let swatch = if col.is_some() { 14.0 } else { 0.0 };
@@ -553,8 +570,8 @@ fn tooltip(ui: &egui::Ui, pos: egui::Pos2, date: &str, d: &Day, tok: bool) {
     painter.rect(
         rect,
         8,
-        egui::Color32::from_rgb(40, 40, 44),
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 66)),
+        pal().tip_bg,
+        egui::Stroke::new(1.0, pal().tip_line),
         egui::StrokeKind::Inside,
     );
     let mut y = rect.top() + 7.0;
@@ -574,18 +591,14 @@ fn tooltip(ui: &egui::Ui, pos: egui::Pos2, date: &str, d: &Day, tok: bool) {
             egui::Align2::LEFT_TOP,
             k,
             egui::FontId::proportional(if strong { 13.0 } else { 12.0 }),
-            if strong {
-                C_TEXT
-            } else {
-                egui::Color32::from_rgb(201, 201, 206)
-            },
+            if strong { pal().text } else { pal().tip_sub },
         );
         painter.text(
             egui::pos2(rect.right() - 10.0, y),
             egui::Align2::RIGHT_TOP,
             v,
             egui::FontId::monospace(if strong { 13.0 } else { 12.0 }),
-            C_TEXT,
+            pal().text,
         );
         y += line_h;
     }
@@ -619,7 +632,7 @@ pub(crate) fn setup_style(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 
     let mut style = (*ctx.style()).clone();
-    style.visuals.override_text_color = Some(C_TEXT);
+    style.visuals.override_text_color = Some(pal().text);
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     ctx.set_style(style);
 }
@@ -627,10 +640,9 @@ pub(crate) fn setup_style(ctx: &egui::Context) {
 fn icon_btn(ui: &mut egui::Ui, txt: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
     if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, 6, egui::Color32::from_white_alpha(14));
+        ui.painter().rect_filled(rect, 6, hover_tint(14));
     }
-    let col = if resp.hovered() { C_TEXT } else { C_DIM };
+    let col = if resp.hovered() { pal().text } else { pal().dim };
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -645,16 +657,16 @@ fn tab_btn(ui: &mut egui::Ui, w: f32, txt: &str, active: bool, mut on: impl FnMu
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
     let painter = ui.painter();
     if active {
-        painter.rect_filled(rect, 7, C_ACCENT_BG);
+        painter.rect_filled(rect, 7, pal().accent_bg);
     } else if resp.hovered() {
-        painter.rect_filled(rect, 7, egui::Color32::from_white_alpha(8));
+        painter.rect_filled(rect, 7, hover_tint(8));
     }
     let col = if active {
-        C_ACCENT_TEXT
+        pal().accent_text
     } else if resp.hovered() {
-        C_TEXT
+        pal().text
     } else {
-        C_DIM
+        pal().dim
     };
     painter.text(
         rect.center(),
@@ -670,8 +682,8 @@ fn tab_btn(ui: &mut egui::Ui, w: f32, txt: &str, active: bool, mut on: impl FnMu
 
 fn pill(ui: &mut egui::Ui, op: f32, dot: egui::Color32, txt: &str) {
     egui::Frame::new()
-        .fill(fade(C_CARD, op))
-        .stroke(egui::Stroke::new(1.0, fade(C_LINE, op)))
+        .fill(fade(pal().card, op))
+        .stroke(egui::Stroke::new(1.0, fade(pal().line, op)))
         .corner_radius(99)
         .inner_margin(egui::Margin::symmetric(9, 3))
         .show(ui, |ui| {
@@ -681,7 +693,7 @@ fn pill(ui: &mut egui::Ui, op: f32, dot: egui::Color32, txt: &str) {
                 ui.painter()
                     .circle_filled(egui::pos2(c.x + 3.0, c.y + 8.0), 3.0, dot);
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new(txt).size(11.0).color(C_DIM));
+                ui.label(egui::RichText::new(txt).size(11.0).color(pal().dim));
             });
         });
 }
@@ -689,9 +701,9 @@ fn pill(ui: &mut egui::Ui, op: f32, dot: egui::Color32, txt: &str) {
 fn row(ui: &mut egui::Ui, k: &str, v: &str) {
     ui.horizontal(|ui| {
         ui.set_height(26.0);
-        ui.label(egui::RichText::new(k).size(12.5).color(C_DIM));
+        ui.label(egui::RichText::new(k).size(12.5).color(pal().dim));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new(v).size(12.5).monospace().color(C_TEXT));
+            ui.label(egui::RichText::new(v).size(12.5).monospace().color(pal().text));
         });
     });
 }
@@ -703,27 +715,27 @@ fn sep(ui: &mut egui::Ui) {
             egui::pos2(r.left(), r.top()),
             egui::pos2(r.right(), r.top()),
         ],
-        egui::Stroke::new(1.0, C_LINE),
+        egui::Stroke::new(1.0, pal().line),
     );
 }
 
 fn stat(ui: &mut egui::Ui, op: f32, w: f32, k: &str, v: &str) {
     egui::Frame::new()
-        .fill(fade(C_CARD, op))
-        .stroke(egui::Stroke::new(1.0, fade(C_LINE, op)))
+        .fill(fade(pal().card, op))
+        .stroke(egui::Stroke::new(1.0, fade(pal().line, op)))
         .corner_radius(10)
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.set_width(w - 24.0);
             ui.vertical(|ui| {
-                ui.label(egui::RichText::new(k).size(11.0).color(C_DIM));
+                ui.label(egui::RichText::new(k).size(11.0).color(pal().dim));
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(v)
                         .size(17.0)
                         .strong()
                         .monospace()
-                        .color(C_TEXT),
+                        .color(pal().text),
                 );
             });
         });
@@ -742,14 +754,14 @@ fn chart_head(ui: &mut egui::Ui, title: &str, total: i64) {
         egui::Align2::LEFT_BOTTOM,
         title,
         egui::FontId::proportional(12.5),
-        C_DIM,
+        pal().dim,
     );
     painter.text(
         egui::pos2(t.right() + 8.0, baseline + 2.0),
         egui::Align2::LEFT_BOTTOM,
         fmt(total),
         egui::FontId::monospace(18.0),
-        C_TEXT,
+        pal().text,
     );
     ui.add_space(6.0);
 }
@@ -764,12 +776,12 @@ fn axis(ui: &mut egui::Ui, snap: &Snapshot) {
         format!("{}/{}", m, day)
     };
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(f(&snap.series[0].0)).size(10.5).color(C_DIM));
+        ui.label(egui::RichText::new(f(&snap.series[0].0)).size(10.5).color(pal().dim));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(f(&snap.series[snap.series.len() - 1].0))
                     .size(10.5)
-                    .color(C_DIM),
+                    .color(pal().dim),
             );
         });
     });
@@ -790,7 +802,7 @@ fn legend(ui: &mut egui::Ui) {
                 c,
             );
             ui.add_space(11.0);
-            ui.label(egui::RichText::new(t).size(10.5).color(C_DIM));
+            ui.label(egui::RichText::new(t).size(10.5).color(pal().dim));
             ui.add_space(8.0);
         }
     });
@@ -799,23 +811,23 @@ fn legend(ui: &mut egui::Ui) {
 fn empty_hint(ui: &mut egui::Ui) {
     ui.vertical_centered(|ui| {
         ui.add_space(40.0);
-        ui.label(egui::RichText::new("暂无用量数据").size(13.0).color(C_DIM));
+        ui.label(egui::RichText::new("暂无用量数据").size(13.0).color(pal().dim));
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new("右键托盘图标 →「登录 DeepSeek 平台…」\n登录一次即可自动同步官方用量")
                 .size(11.0)
-                .color(C_DIM),
+                .color(pal().dim),
         );
     });
 }
 
 fn note_bar(ui: &mut egui::Ui, note: &str) {
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(48, 40, 24))
+        .fill(pal().note_bg)
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(note).size(10.5).color(C_AMBER));
+            ui.label(egui::RichText::new(note).size(10.5).color(pal().warn));
         });
 }
 
@@ -858,7 +870,7 @@ pub fn run_settings() {
     };
     let viewport = egui::ViewportBuilder::default()
         .with_icon(icon)
-        .with_inner_size([340.0, 440.0])
+        .with_inner_size([340.0, 490.0])
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top()
@@ -871,12 +883,14 @@ pub fn run_settings() {
     let cfg = store::load_config();
     let masked = mask_key(&cfg.api_key);
     let (op0, ct0) = (cfg.opacity.clamp(0.2, 1.0), cfg.click_through);
+    let light0 = cfg.theme == "light";
 
     let _ = eframe::run_native(
         "DeepSeek 小组件设置",
         options,
         Box::new(move |cc| {
             setup_style(&cc.egui_ctx);
+            apply_theme(&cc.egui_ctx, light0);
             form_style(&cc.egui_ctx);
             Ok(Box::new(SettingsApp {
                 key_input: String::new(),
@@ -884,6 +898,7 @@ pub fn run_settings() {
                 cur_masked: masked,
                 opacity: op0,
                 click_through: ct0,
+                light: light0,
                 msg: String::new(),
             }) as Box<dyn eframe::App>)
         }),
@@ -904,23 +919,23 @@ fn mask_key(cur: &str) -> String {
 fn form_style(ctx: &egui::Context) {
     ctx.style_mut(|s| {
         let v = &mut s.visuals;
-        v.extreme_bg_color = egui::Color32::from_rgb(15, 15, 17); // TextEdit/滑条槽底色
+        v.extreme_bg_color = pal().extreme_bg; // TextEdit/滑条槽底色
         v.selection.bg_fill = C_ACCENT;
-        v.selection.stroke = egui::Stroke::new(1.0, C_ACCENT_TEXT);
+        v.selection.stroke = egui::Stroke::new(1.0, pal().accent_text);
         for w in [
             &mut v.widgets.inactive,
             &mut v.widgets.hovered,
             &mut v.widgets.active,
             &mut v.widgets.open,
         ] {
-            w.bg_fill = C_CARD;
-            w.weak_bg_fill = C_CARD;
-            w.bg_stroke = egui::Stroke::new(1.0, C_LINE);
+            w.bg_fill = pal().card;
+            w.weak_bg_fill = pal().card;
+            w.bg_stroke = egui::Stroke::new(1.0, pal().line);
             w.corner_radius = egui::CornerRadius::same(7);
-            w.fg_stroke = egui::Stroke::new(1.0, C_TEXT);
+            w.fg_stroke = egui::Stroke::new(1.0, pal().text);
         }
-        v.widgets.hovered.bg_fill = egui::Color32::from_rgb(40, 40, 44);
-        v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(40, 40, 44);
+        v.widgets.hovered.bg_fill = pal().hover_card;
+        v.widgets.hovered.weak_bg_fill = pal().hover_card;
         v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, C_ACCENT);
         v.widgets.active.bg_stroke = egui::Stroke::new(1.0, C_ACCENT);
         s.spacing.slider_width = 130.0;
@@ -934,6 +949,7 @@ struct SettingsApp {
     cur_masked: String,
     opacity: f32,
     click_through: bool,
+    light: bool,
     msg: String,
 }
 
@@ -956,8 +972,8 @@ impl eframe::App for SettingsApp {
             ui.painter().rect(
                 ctx.screen_rect().shrink(0.5),
                 14,
-                C_BG,
-                egui::Stroke::new(1.0, C_LINE),
+                pal().bg,
+                egui::Stroke::new(1.0, pal().line),
                 egui::StrokeKind::Inside,
             );
             // 顶栏（可拖动）
@@ -992,7 +1008,7 @@ impl eframe::App for SettingsApp {
                         egui::RichText::new("小组件设置")
                             .strong()
                             .size(14.0)
-                            .color(C_TEXT),
+                            .color(pal().text),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_btn(ui, "×").clicked() {
@@ -1021,9 +1037,9 @@ impl eframe::App for SettingsApp {
                     let t = if self.show_key { "隐藏" } else { "显示" };
                     if ui
                         .add(
-                            egui::Button::new(egui::RichText::new(t).size(11.5).color(C_DIM))
+                            egui::Button::new(egui::RichText::new(t).size(11.5).color(pal().dim))
                                 .fill(egui::Color32::TRANSPARENT)
-                                .stroke(egui::Stroke::new(1.0, C_LINE))
+                                .stroke(egui::Stroke::new(1.0, pal().line))
                                 .corner_radius(7)
                                 .min_size(egui::vec2(44.0, 26.0)),
                         )
@@ -1041,7 +1057,40 @@ impl eframe::App for SettingsApp {
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     ui.set_height(28.0);
-                    ui.label(egui::RichText::new("背景不透明度").size(12.5).color(C_DIM));
+                    ui.label(egui::RichText::new("主题").size(12.5).color(pal().dim));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let mut pick = |ui: &mut egui::Ui, label: &str, val: bool| {
+                            let active = self.light == val;
+                            let (col, bg) = if active {
+                                (pal().accent_text, pal().accent_bg)
+                            } else {
+                                (pal().dim, egui::Color32::TRANSPARENT)
+                            };
+                            let b = ui.add(
+                                egui::Button::new(egui::RichText::new(label).size(12.0).color(col))
+                                    .fill(bg)
+                                    .stroke(egui::Stroke::new(1.0, pal().line))
+                                    .corner_radius(7)
+                                    .min_size(egui::vec2(52.0, 24.0)),
+                            );
+                            if b.clicked() && self.light != val {
+                                self.light = val;
+                                // 即时预览：切换本窗口的主题与表单风格
+                                apply_theme(ui.ctx(), val);
+                                form_style(ui.ctx());
+                            }
+                        };
+                        pick(ui, "☀ 浅色", true);
+                        pick(ui, "🌙 深色", false);
+                    });
+                });
+                ui.add_space(6.0);
+                sep(ui);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.set_height(28.0);
+                    ui.label(egui::RichText::new("背景不透明度").size(12.5).color(pal().dim));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add(
                             egui::Slider::new(&mut self.opacity, 0.2..=1.0)
@@ -1063,7 +1112,7 @@ impl eframe::App for SettingsApp {
                     &mut self.click_through,
                     egui::RichText::new("鼠标穿透（不遮挡点击）")
                         .size(12.5)
-                        .color(C_TEXT),
+                        .color(pal().text),
                 );
                 ui.add_space(2.0);
                 ui.label(
@@ -1071,7 +1120,7 @@ impl eframe::App for SettingsApp {
                         "开启后小组件完全不响应鼠标（无法拖动/点击），\n如需恢复请从托盘菜单进入「设置…」关闭本选项。",
                     )
                     .size(10.5)
-                    .color(C_DIM),
+                    .color(pal().dim),
                 );
                 ui.add_space(2.0);
             });
@@ -1092,9 +1141,9 @@ impl eframe::App for SettingsApp {
                         .min_size(egui::vec2(92.0, 30.0)),
                     );
                     let cancel = ui.add(
-                        egui::Button::new(egui::RichText::new("取消").size(13.0).color(C_TEXT))
-                            .fill(C_CARD)
-                            .stroke(egui::Stroke::new(1.0, C_LINE))
+                        egui::Button::new(egui::RichText::new("取消").size(13.0).color(pal().text))
+                            .fill(pal().card)
+                            .stroke(egui::Stroke::new(1.0, pal().line))
                             .corner_radius(8)
                             .min_size(egui::vec2(68.0, 30.0)),
                     );
@@ -1102,7 +1151,7 @@ impl eframe::App for SettingsApp {
                         ui.label(
                             egui::RichText::new("保存后 1 秒内生效")
                                 .size(10.5)
-                                .color(C_DIM),
+                                .color(pal().dim),
                         );
                     });
                     if save.clicked() {
@@ -1116,6 +1165,7 @@ impl eframe::App for SettingsApp {
                             }
                             c.opacity = self.opacity;
                             c.click_through = self.click_through;
+                            c.theme = if self.light { "light".into() } else { "dark".into() };
                             store::save_config(&c);
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
@@ -1138,15 +1188,15 @@ fn section(ui: &mut egui::Ui, title: &str) {
         egui::RichText::new(title)
             .size(11.0)
             .strong()
-            .color(C_DIM),
+            .color(pal().dim),
     );
     ui.add_space(6.0);
 }
 
 fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
-        .fill(C_CARD)
-        .stroke(egui::Stroke::new(1.0, C_LINE))
+        .fill(pal().card)
+        .stroke(egui::Stroke::new(1.0, pal().line))
         .corner_radius(10)
         .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
@@ -1155,19 +1205,105 @@ fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
-// 配色
-const C_BG: egui::Color32 = egui::Color32::from_rgb(19, 19, 21);
-const C_CARD: egui::Color32 = egui::Color32::from_rgb(28, 28, 31);
-const C_LINE: egui::Color32 = egui::Color32::from_rgb(44, 44, 48);
-const C_GRID: egui::Color32 = egui::Color32::from_rgb(33, 33, 36);
-const C_TEXT: egui::Color32 = egui::Color32::from_rgb(236, 236, 238);
-const C_DIM: egui::Color32 = egui::Color32::from_rgb(142, 142, 147);
+// ───────── 配色 / 主题 ─────────
+
+// 两个主题共用的颜色
 const C_ACCENT: egui::Color32 = egui::Color32::from_rgb(79, 142, 247);
-const C_ACCENT_BG: egui::Color32 = egui::Color32::from_rgb(36, 53, 88);
-const C_ACCENT_TEXT: egui::Color32 = egui::Color32::from_rgb(148, 186, 255);
 const C_B1: egui::Color32 = egui::Color32::from_rgb(167, 205, 245);
 const C_B2: egui::Color32 = egui::Color32::from_rgb(91, 156, 240);
 const C_B3: egui::Color32 = egui::Color32::from_rgb(31, 111, 224);
 const C_GREEN: egui::Color32 = egui::Color32::from_rgb(52, 199, 123);
 const C_RED: egui::Color32 = egui::Color32::from_rgb(240, 106, 93);
-const C_AMBER: egui::Color32 = egui::Color32::from_rgb(240, 169, 93);
+
+/// 随主题变化的调色板
+struct Pal {
+    bg: egui::Color32,
+    card: egui::Color32,
+    line: egui::Color32,
+    grid: egui::Color32,
+    text: egui::Color32,
+    dim: egui::Color32,
+    accent_bg: egui::Color32,
+    accent_text: egui::Color32,
+    tip_bg: egui::Color32,
+    tip_line: egui::Color32,
+    tip_sub: egui::Color32,
+    note_bg: egui::Color32,
+    warn: egui::Color32,
+    extreme_bg: egui::Color32,
+    hover_card: egui::Color32,
+}
+
+const DARK: Pal = Pal {
+    bg: egui::Color32::from_rgb(19, 19, 21),
+    card: egui::Color32::from_rgb(28, 28, 31),
+    line: egui::Color32::from_rgb(44, 44, 48),
+    grid: egui::Color32::from_rgb(33, 33, 36),
+    text: egui::Color32::from_rgb(236, 236, 238),
+    dim: egui::Color32::from_rgb(142, 142, 147),
+    accent_bg: egui::Color32::from_rgb(36, 53, 88),
+    accent_text: egui::Color32::from_rgb(148, 186, 255),
+    tip_bg: egui::Color32::from_rgb(40, 40, 44),
+    tip_line: egui::Color32::from_rgb(60, 60, 66),
+    tip_sub: egui::Color32::from_rgb(201, 201, 206),
+    note_bg: egui::Color32::from_rgb(48, 40, 24),
+    warn: egui::Color32::from_rgb(240, 169, 93),
+    extreme_bg: egui::Color32::from_rgb(15, 15, 17),
+    hover_card: egui::Color32::from_rgb(40, 40, 44),
+};
+
+const LIGHT: Pal = Pal {
+    bg: egui::Color32::from_rgb(248, 248, 250),
+    card: egui::Color32::from_rgb(255, 255, 255),
+    line: egui::Color32::from_rgb(222, 224, 230),
+    grid: egui::Color32::from_rgb(234, 236, 240),
+    text: egui::Color32::from_rgb(32, 33, 36),
+    dim: egui::Color32::from_rgb(112, 117, 125),
+    accent_bg: egui::Color32::from_rgb(224, 236, 255),
+    accent_text: egui::Color32::from_rgb(28, 89, 201),
+    tip_bg: egui::Color32::from_rgb(255, 255, 255),
+    tip_line: egui::Color32::from_rgb(210, 214, 222),
+    tip_sub: egui::Color32::from_rgb(90, 95, 105),
+    note_bg: egui::Color32::from_rgb(255, 244, 215),
+    warn: egui::Color32::from_rgb(176, 108, 22),
+    extreme_bg: egui::Color32::from_rgb(238, 239, 242),
+    hover_card: egui::Color32::from_rgb(235, 238, 243),
+};
+
+/// 当前是否浅色主题（进程内全局；小组件与设置窗口是独立进程，互不干扰）
+static LIGHT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn is_light() -> bool {
+    LIGHT_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn pal() -> &'static Pal {
+    if is_light() {
+        &LIGHT
+    } else {
+        &DARK
+    }
+}
+
+/// 悬停高亮：深色主题提白、浅色主题压黑
+fn hover_tint(a: u8) -> egui::Color32 {
+    if is_light() {
+        egui::Color32::from_black_alpha(a)
+    } else {
+        egui::Color32::from_white_alpha(a)
+    }
+}
+
+/// 切换/应用主题：更新全局开关与 egui 视觉样式
+fn apply_theme(ctx: &egui::Context, light: bool) {
+    LIGHT_ON.store(light, std::sync::atomic::Ordering::Relaxed);
+    let mut style = (*ctx.style()).clone();
+    style.visuals = if light {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+    style.visuals.override_text_color = Some(pal().text);
+    ctx.set_style(style);
+    ctx.request_repaint();
+}

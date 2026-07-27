@@ -57,6 +57,12 @@ pub struct Config {
     /// 鼠标穿透（不遮挡点击）
     #[serde(default)]
     pub click_through: bool,
+    /// 主题："dark" | "light"
+    #[serde(default = "def_theme")]
+    pub theme: String,
+}
+fn def_theme() -> String {
+    "dark".into()
 }
 fn def_refresh() -> u64 {
     60
@@ -84,6 +90,7 @@ impl Default for Config {
             window_height: 420.0,
             opacity: 1.0,
             click_through: false,
+            theme: def_theme(),
         }
     }
 }
