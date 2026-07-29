@@ -33,4 +33,4 @@ target/release/DeepSeekWidget.exe
 
 - [x] 优化 UI，~~现在的有点丑了我说白了~~
 - [x] 支持自定义窗口透明度
-- [ ] 支持深色 / 浅色主题
+- [x] 支持深色 / 浅色主题

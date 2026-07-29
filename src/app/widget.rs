@@ -5,6 +5,7 @@
 use crate::app::store::{self, Config};
 use crate::core::{Balance, Day};
 use eframe::egui;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -49,11 +50,30 @@ pub fn run() {
     );
 }
 
+#[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Balance,
     Requests,
     Tokens,
 }
+
+impl Tab {
+    fn idx(self) -> usize {
+        match self {
+            Tab::Balance => 0,
+            Tab::Requests => 1,
+            Tab::Tokens => 2,
+        }
+    }
+}
+
+/// 切换分页时正在进行的滑动过渡
+#[derive(Clone, Copy)]
+struct TabAnim {
+    from: Tab,
+    start: std::time::Instant,
+}
+const TAB_ANIM_SECS: f32 = 0.22;
 
 struct App {
     cfg: Config,
@@ -64,6 +84,12 @@ struct App {
     tab: Tab,
     snap: Arc<Mutex<Snapshot>>,
     trigger: mpsc::Sender<()>,
+    /// 后台线程是否正在取数（驱动刷新按钮的旋转动效）
+    fetching: Arc<AtomicBool>,
+    /// 刷新图标累计旋转角（弧度，随取数持续增长，取数结束后顺势转完当前一圈再停）
+    spin_angle: f32,
+    /// 底部分页切换时正在播放的滑动过渡（None 表示无动画，静止显示 self.tab）
+    tab_anim: Option<TabAnim>,
 }
 
 impl App {
@@ -77,14 +103,18 @@ impl App {
             ..Default::default()
         }));
         let (tx, rx) = mpsc::channel::<()>();
+        let fetching = Arc::new(AtomicBool::new(false));
         // 后台取数线程
         {
             let snap = snap.clone();
             let ctx = cc.egui_ctx.clone();
             let days = cfg.days;
             let shared = shared_cfg.clone();
+            let fetching = fetching.clone();
             let interval = cfg.refresh_seconds.max(10);
             thread::spawn(move || loop {
+                fetching.store(true, Ordering::Relaxed);
+                ctx.request_repaint(); // 立即唤醒一帧，让刷新图标马上开始转
                 let cfg_now = shared.lock().unwrap().clone();
                 let res = store::get_usage(days);
                 let bal = store::fetch_balance(&cfg_now);
@@ -107,6 +137,7 @@ impl App {
                         }
                     }
                 }
+                fetching.store(false, Ordering::Relaxed);
                 ctx.request_repaint();
                 // 等间隔或被手动唤醒
                 let _ = rx.recv_timeout(Duration::from_secs(interval));
@@ -121,7 +152,22 @@ impl App {
             tab: Tab::Balance,
             snap,
             trigger: tx,
+            fetching,
+            spin_angle: 0.0,
+            tab_anim: None,
         }
+    }
+
+    /// 切到新分页并记下滑动过渡的起点（相同分页点击不触发动画）
+    fn switch_tab(&mut self, new: Tab) {
+        if new == self.tab {
+            return;
+        }
+        self.tab_anim = Some(TabAnim {
+            from: self.tab,
+            start: std::time::Instant::now(),
+        });
+        self.tab = new;
     }
 }
 
@@ -147,6 +193,29 @@ impl eframe::App for App {
             apply_theme(ctx, light);
             self.applied_light = Some(light);
         }
+        // 主题色的丝滑过渡：把 0/1 目标值缓动成连续的 t，pal() 据此在两套调色板间插值
+        let t = ctx.animate_bool_with_time_and_easing(
+            egui::Id::new("ds_theme_t"),
+            is_light(),
+            0.28,
+            egui::emath::easing::cubic_out,
+        );
+        THEME_T.store(t.to_bits(), Ordering::Relaxed);
+        // 刷新图标的旋转：取数期间持续旋转，取数结束后顺势转完当前一圈再停，不会戛然而止
+        let dt = ctx.input(|i| i.stable_dt);
+        const SPIN_SPEED: f32 = std::f32::consts::TAU * 1.1; // 每秒圈数
+        if self.fetching.load(Ordering::Relaxed) {
+            self.spin_angle += dt * SPIN_SPEED;
+            ctx.request_repaint();
+        } else {
+            let rem = (-self.spin_angle).rem_euclid(std::f32::consts::TAU);
+            if rem > 0.001 {
+                self.spin_angle += (dt * SPIN_SPEED).min(rem);
+                ctx.request_repaint();
+            } else {
+                self.spin_angle = 0.0;
+            }
+        }
         // 鼠标穿透开关（只在变化时下发）
         if self.applied_passthrough != Some(self.cfg.click_through) {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(
@@ -159,18 +228,24 @@ impl eframe::App for App {
         let snap = self.snap.lock().unwrap().clone();
         let op = self.cfg.opacity.clamp(0.2, 1.0);
 
-        let frame = egui::Frame::new()
-            .fill(fade(pal().bg, op))
-            .corner_radius(14)
-            .stroke(egui::Stroke::new(1.0, fade(pal().line, op)))
-            .inner_margin(egui::Margin {
-                left: 14,
-                right: 14,
-                top: 10,
-                bottom: 12,
-            });
+        // 背景手动按窗口实际大小绘制（同设置窗口）：egui::Frame 的背景矩形
+        // 是按内容实际渲染尺寸算的，内容略高于窗口时圆角下半截会画到窗口
+        // 外面，底边看起来就变成了直角——余额页比图表页内容更容易触发。
+        let frame = egui::Frame::new().inner_margin(egui::Margin {
+            left: 14,
+            right: 14,
+            top: 10,
+            bottom: 12,
+        });
 
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+            ui.painter().rect(
+                ctx.screen_rect().shrink(0.5),
+                14,
+                fade(pal().bg, op),
+                egui::Stroke::new(1.0, fade(pal().line, op)),
+                egui::StrokeKind::Inside,
+            );
             // 固定底部标签栏高度，内容区与其互不侵占，避免被裁切
             let full = ui.max_rect();
             let tab_h = 38.0;
@@ -189,10 +264,31 @@ impl eframe::App for App {
                     note_bar(ui, &snap.note);
                 }
                 ui.add_space(2.0);
-                match self.tab {
-                    Tab::Balance => self.page_balance(ui, &snap),
-                    Tab::Requests => self.page_requests(ui, &snap),
-                    Tab::Tokens => self.page_tokens(ui, &snap),
+
+                if let Some(anim) = self.tab_anim {
+                    let elapsed = anim.start.elapsed().as_secs_f32();
+                    let raw_t = (elapsed / TAB_ANIM_SECS).clamp(0.0, 1.0);
+                    let t = egui::emath::easing::cubic_out(raw_t);
+                    let page_rect = ui.available_rect_before_wrap();
+
+                    // 新旧两页原地交叉淡入淡出：不改变布局矩形、不动裁剪区，
+                    // 只用不透明度过渡，避免平移+裁剪带来的额外开销和边缘问题。
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(page_rect), |ui| {
+                        ui.set_opacity(1.0 - t);
+                        self.page(ui, anim.from, &snap);
+                    });
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(page_rect), |ui| {
+                        ui.set_opacity(t);
+                        self.page(ui, self.tab, &snap);
+                    });
+
+                    if raw_t >= 1.0 {
+                        self.tab_anim = None;
+                    } else {
+                        ctx.request_repaint();
+                    }
+                } else {
+                    self.page(ui, self.tab, &snap);
                 }
             });
 
@@ -215,7 +311,7 @@ impl App {
         // 若覆盖按钮，点按钮会同时触发窗口拖动的模态循环，导致 UI 卡顿）
         let drag_rect = egui::Rect::from_min_size(
             ui.cursor().min,
-            egui::vec2((ui.available_width() - 150.0).max(0.0), bar_h),
+            egui::vec2((ui.available_width() - 124.0).max(0.0), bar_h),
         );
         let drag = ui.interact(
             drag_rect,
@@ -254,21 +350,18 @@ impl App {
                     if icon_btn(ui, "×").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                    if icon_btn(ui, "—").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                    }
                     if icon_btn(ui, "⚙").clicked() {
                         crate::app::open_settings();
                     }
-                    let sun = if is_light() { "🌙" } else { "☀" };
-                    if icon_btn(ui, sun).clicked() {
-                        // 立即生效并落盘；下一帧由 applied_light 检测统一应用
+                    if theme_icon_btn(ui).clicked() {
+                        // 立即生效并落盘；下一帧由 applied_light 检测统一应用，
+                        // theme_t 的缓动会让图标与配色平滑过渡到新状态
                         let mut c = store::load_config();
                         c.theme = if is_light() { "dark".into() } else { "light".into() };
                         store::save_config(&c);
                         self.cfg.theme = c.theme;
                     }
-                    if icon_btn(ui, "⟳").clicked() {
+                    if spin_icon_btn(ui, self.spin_angle).clicked() {
                         let _ = self.trigger.send(());
                     }
                 });
@@ -280,26 +373,62 @@ impl App {
     fn tabs(&mut self, ui: &mut egui::Ui) {
         let op = self.cfg.opacity.clamp(0.2, 1.0);
         ui.add_space(6.0);
-        egui::Frame::new()
-            .fill(fade(pal().card, op))
-            .stroke(egui::Stroke::new(1.0, fade(pal().line, op)))
-            .corner_radius(9)
-            .inner_margin(egui::Margin::same(3))
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.x = 3.0;
-                ui.horizontal(|ui| {
-                    let w = (ui.available_width() - 6.0) / 3.0;
-                    tab_btn(ui, w, "余额", matches!(self.tab, Tab::Balance), || {
-                        self.tab = Tab::Balance
-                    });
-                    tab_btn(ui, w, "请求次数", matches!(self.tab, Tab::Requests), || {
-                        self.tab = Tab::Requests
-                    });
-                    tab_btn(ui, w, "Tokens", matches!(self.tab, Tab::Tokens), || {
-                        self.tab = Tab::Tokens
-                    });
+
+        let margin = 3.0;
+        let row_h = 26.0;
+        let outer_rect = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2(ui.available_width(), row_h + margin * 2.0),
+        );
+        // 直接画背景+描边，不走 egui::Frame 的"先占位、结束时再回填"机制：
+        // 这一页之前已经有好几个 Frame（卡片、余额/Tokens 统计块）渲染过，
+        // 占位索引多了之后这个最外层圆角背景偶发会被写歪，右下角变直角。
+        // 直接画就没有这个"稍后回填"的中间状态，不受之前渲染过多少个
+        // Frame 影响。
+        ui.painter().rect(
+            outer_rect,
+            9,
+            fade(pal().card, op),
+            egui::Stroke::new(1.0, fade(pal().line, op)),
+            egui::StrokeKind::Inside,
+        );
+
+        let inner_rect = outer_rect.shrink(margin);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            let gap = 3.0;
+            let w = (ui.available_width() - 2.0 * gap) / 3.0;
+            let row_min = ui.cursor().min;
+
+            // 高亮滑块的位置：与下方内容的滑动过渡共用同一份进度和缓动，步调一致
+            let pill_idx = match self.tab_anim {
+                Some(anim) => {
+                    let raw_t =
+                        (anim.start.elapsed().as_secs_f32() / TAB_ANIM_SECS).clamp(0.0, 1.0);
+                    let t = egui::emath::easing::cubic_out(raw_t);
+                    anim.from.idx() as f32 + t * (self.tab.idx() as f32 - anim.from.idx() as f32)
+                }
+                None => self.tab.idx() as f32,
+            };
+            let hl_rect = egui::Rect::from_min_size(
+                egui::pos2(row_min.x + pill_idx * (w + gap), row_min.y),
+                egui::vec2(w, row_h),
+            );
+            ui.painter().rect_filled(hl_rect, 7, pal().accent_bg);
+
+            ui.horizontal(|ui| {
+                tab_btn(ui, w, "余额", matches!(self.tab, Tab::Balance), || {
+                    self.switch_tab(Tab::Balance)
+                });
+                tab_btn(ui, w, "请求次数", matches!(self.tab, Tab::Requests), || {
+                    self.switch_tab(Tab::Requests)
+                });
+                tab_btn(ui, w, "Tokens", matches!(self.tab, Tab::Tokens), || {
+                    self.switch_tab(Tab::Tokens)
                 });
             });
+        });
+        ui.advance_cursor_after_rect(outer_rect);
     }
 }
 
@@ -379,6 +508,14 @@ impl App {
 // ───────── 图表页 ─────────
 
 impl App {
+    fn page(&self, ui: &mut egui::Ui, tab: Tab, snap: &Snapshot) {
+        match tab {
+            Tab::Balance => self.page_balance(ui, snap),
+            Tab::Requests => self.page_requests(ui, snap),
+            Tab::Tokens => self.page_tokens(ui, snap),
+        }
+    }
+
     fn page_requests(&self, ui: &mut egui::Ui, snap: &Snapshot) {
         let total: i64 = snap.series.iter().map(|(_, d)| d.requests).sum();
         chart_head(ui, "API 请求次数", total);
@@ -653,12 +790,63 @@ fn icon_btn(ui: &mut egui::Ui, txt: &str) -> egui::Response {
     resp
 }
 
+/// 刷新按钮：取数期间图标持续旋转，取数结束后顺势转完当前一圈再停。
+fn spin_icon_btn(ui: &mut egui::Ui, angle: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 6, hover_tint(14));
+    }
+    let col = if resp.hovered() { pal().text } else { pal().dim };
+    draw_glyph(ui.painter(), rect.center(), "⟳", 13.0, col, angle, 1.0);
+    resp
+}
+
+/// 深浅主题切换按钮：随 theme_t 在「☀」「🌙」之间旋转 + 淡入淡出交叉过渡。
+fn theme_icon_btn(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 6, hover_tint(14));
+    }
+    let col = if resp.hovered() { pal().text } else { pal().dim };
+    let t = theme_t();
+    let angle = t * std::f32::consts::TAU;
+    let painter = ui.painter();
+    draw_glyph(painter, rect.center(), "☀", 13.0, col, angle, 1.0 - t);
+    draw_glyph(painter, rect.center(), "🌙", 13.0, col, angle, t);
+    resp
+}
+
+/// 以 `center` 为轴心旋转、按 `opacity` 淡入淡出地画一个字形（旋转角为 0 时走无旋转的快速路径）。
+fn draw_glyph(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    txt: &str,
+    size: f32,
+    color: egui::Color32,
+    angle: f32,
+    opacity: f32,
+) {
+    if opacity <= 0.01 {
+        return;
+    }
+    let galley = painter.layout_no_wrap(txt.to_owned(), egui::FontId::proportional(size), color);
+    let half = galley.size() / 2.0;
+    let pos = if angle.abs() < 1e-3 {
+        center - half
+    } else {
+        center - egui::emath::Rot2::from_angle(angle) * half
+    };
+    let shape = egui::epaint::TextShape::new(pos, galley, color)
+        .with_angle(angle)
+        .with_opacity_factor(opacity);
+    painter.add(egui::Shape::Text(shape));
+}
+
 fn tab_btn(ui: &mut egui::Ui, w: f32, txt: &str, active: bool, mut on: impl FnMut()) {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
     let painter = ui.painter();
-    if active {
-        painter.rect_filled(rect, 7, pal().accent_bg);
-    } else if resp.hovered() {
+    // 激活态的背景由 tabs() 里跨三个按钮共享的滑动高亮块统一绘制，这里只画悬停态
+    if !active && resp.hovered() {
         painter.rect_filled(rect, 7, hover_tint(8));
     }
     let col = if active {
@@ -1216,6 +1404,7 @@ const C_GREEN: egui::Color32 = egui::Color32::from_rgb(52, 199, 123);
 const C_RED: egui::Color32 = egui::Color32::from_rgb(240, 106, 93);
 
 /// 随主题变化的调色板
+#[derive(Clone, Copy)]
 struct Pal {
     bg: egui::Color32,
     card: egui::Color32,
@@ -1271,32 +1460,76 @@ const LIGHT: Pal = Pal {
 };
 
 /// 当前是否浅色主题（进程内全局；小组件与设置窗口是独立进程，互不干扰）
-static LIGHT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LIGHT_ON: AtomicBool = AtomicBool::new(false);
+
+/// 深色→浅色的连续过渡进度（0.0=全深色，1.0=全浅色），由小组件主循环每帧
+/// 用 egui 的缓动动画驱动；设置窗口不跑主循环动画，靠 apply_theme 直接置成 0/1。
+static THEME_T: AtomicU32 = AtomicU32::new(0); // f32(0.0) 的位表示
 
 fn is_light() -> bool {
-    LIGHT_ON.load(std::sync::atomic::Ordering::Relaxed)
+    LIGHT_ON.load(Ordering::Relaxed)
 }
 
-fn pal() -> &'static Pal {
-    if is_light() {
-        &LIGHT
-    } else {
-        &DARK
+fn theme_t() -> f32 {
+    f32::from_bits(THEME_T.load(Ordering::Relaxed))
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8
+}
+
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(
+        lerp_u8(a.r(), b.r(), t),
+        lerp_u8(a.g(), b.g(), t),
+        lerp_u8(a.b(), b.b(), t),
+        lerp_u8(a.a(), b.a(), t),
+    )
+}
+
+/// 当前调色板：按 theme_t 在深/浅两套之间插值，实现整体丝滑过渡。
+fn pal() -> Pal {
+    let t = theme_t();
+    if t <= 0.0 {
+        return DARK;
+    }
+    if t >= 1.0 {
+        return LIGHT;
+    }
+    Pal {
+        bg: lerp_color(DARK.bg, LIGHT.bg, t),
+        card: lerp_color(DARK.card, LIGHT.card, t),
+        line: lerp_color(DARK.line, LIGHT.line, t),
+        grid: lerp_color(DARK.grid, LIGHT.grid, t),
+        text: lerp_color(DARK.text, LIGHT.text, t),
+        dim: lerp_color(DARK.dim, LIGHT.dim, t),
+        accent_bg: lerp_color(DARK.accent_bg, LIGHT.accent_bg, t),
+        accent_text: lerp_color(DARK.accent_text, LIGHT.accent_text, t),
+        tip_bg: lerp_color(DARK.tip_bg, LIGHT.tip_bg, t),
+        tip_line: lerp_color(DARK.tip_line, LIGHT.tip_line, t),
+        tip_sub: lerp_color(DARK.tip_sub, LIGHT.tip_sub, t),
+        note_bg: lerp_color(DARK.note_bg, LIGHT.note_bg, t),
+        warn: lerp_color(DARK.warn, LIGHT.warn, t),
+        extreme_bg: lerp_color(DARK.extreme_bg, LIGHT.extreme_bg, t),
+        hover_card: lerp_color(DARK.hover_card, LIGHT.hover_card, t),
     }
 }
 
-/// 悬停高亮：深色主题提白、浅色主题压黑
+/// 悬停高亮：深色主题提白、浅色主题压黑（以过渡过半为界，与整体配色同步切换）
 fn hover_tint(a: u8) -> egui::Color32 {
-    if is_light() {
+    if theme_t() > 0.5 {
         egui::Color32::from_black_alpha(a)
     } else {
         egui::Color32::from_white_alpha(a)
     }
 }
 
-/// 切换/应用主题：更新全局开关与 egui 视觉样式
+/// 切换/应用主题：更新全局开关与 egui 视觉样式。
+/// 同时把 THEME_T 直接置到目标值——小组件主循环随后会在同一帧内用缓动动画
+/// 接管并覆盖这个值，设置窗口（不跑动画循环）则依赖这里的即时赋值来正确取色。
 fn apply_theme(ctx: &egui::Context, light: bool) {
-    LIGHT_ON.store(light, std::sync::atomic::Ordering::Relaxed);
+    LIGHT_ON.store(light, Ordering::Relaxed);
+    THEME_T.store((if light { 1.0f32 } else { 0.0f32 }).to_bits(), Ordering::Relaxed);
     let mut style = (*ctx.style()).clone();
     style.visuals = if light {
         egui::Visuals::light()
